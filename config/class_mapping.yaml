@@ -1,0 +1,45 @@
+# class_mapping.yaml -- VERSI TESTING 1 KELAS: "portal" (horizontal)
+#
+# ====================================================================
+# 1) class_names -- GANTI kalau nama kelas Anda di Roboflow beda dari "portal"
+#    (harus PERSIS SAMA, termasuk huruf besar/kecil).
+#    Cek nama kelas model Anda:
+#      python3 -c "from ultralytics import YOLO; print(YOLO('best.pt').names)"
+# ====================================================================
+class_names:
+  - portal
+
+# ====================================================================
+# 2) class_mapping -- portal diasumsikan HORIZONTAL (robot merunduk untuk
+#    lewat di bawahnya). Kalau maksud Anda portal harus DIHINDARI menyamping
+#    (bukan dilewati dengan merunduk), ganti nilainya jadi "vertical".
+# ====================================================================
+class_mapping:
+  portal: horizontal
+
+# ====================================================================
+# 3) Threshold deteksi & NMS -- nilai default, aman untuk mulai testing
+# ====================================================================
+confidence_threshold: 0.5
+nms_iou_threshold: 0.45
+nms_center_distance: 20
+min_box_area: 900
+max_box_area_ratio: 0.6
+vertical_aspect_ratio: 1.4
+horizontal_aspect_ratio: 1.4
+model_input_size: 640
+
+# ====================================================================
+# 4) Ground-plane distance -- MATI. Untuk kelas HORIZONTAL seperti portal,
+#    ground-plane distance MEMANG TIDAK BERLAKU (lihat distance_estimator.py
+#    dan command_logic.py) -- portal/palang tidak menyentuh lantai, jadi
+#    robot SELALU pakai area_ratio untuk kelas ini, apapun setting di sini.
+# ====================================================================
+distance:
+  use_distance_based: false
+  camera_height: 0.30
+  camera_tilt_deg: 15.0
+  focal_length_y: 500.0
+  principal_point_y: 240.0
+  near_distance_stop_m: 0.4
+  near_distance_turn_m: 0.8

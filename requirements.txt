@@ -1,0 +1,8 @@
+# Wajib salah satu (tergantung platform):
+#   - Orange Pi 5 Pro (ARM, aarch64): rknn-toolkit-lite2 (install manual dari wheel Rockchip,
+#     TIDAK tersedia di PyPI publik biasa -- lihat README bagian instalasi)
+#   - PC/laptop non-ARM (untuk development/testing): onnxruntime
+onnxruntime>=1.16.0
+opencv-python>=4.8.0
+pyyaml>=6.0
+numpy>=1.24.0
