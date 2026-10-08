@@ -104,6 +104,9 @@ Cek output: `ros2 topic echo /quadruped/cmd_vision`
 |---|---|---|
 | `capture_rate_hz` | 15.0 | Rate capture kamera (bukan lagi rate publish -- publish sekarang secepat worker thread menyelesaikan inferensi) |
 | `frame_buffer_size` | 2 | Ukuran buffer antara capture & worker (frame lebih lama otomatis dibuang kalau penuh) |
+| `command_stability_frames` | 3 | Jumlah frame kandidat yang sama sebelum command normal berubah. `mundur` selalu langsung diterapkan. |
+| `obstacle_confirmation_frames` | 3 | Deteksi harus muncul berurutan sebanyak ini sebelum dipakai untuk command normal. |
+| `obstacle_hold_seconds` | 0.30 | Deteksi yang sudah valid dipertahankan selama durasi ini bila YOLO melewatkannya sesaat. |
 
 Di `config/class_mapping.yaml`, section `distance` (semua opsional):
 
@@ -116,8 +119,27 @@ Di `config/class_mapping.yaml`, section `distance` (semua opsional):
 | `principal_point_y` | 240.0 | Titik utama vertikal (pixel, umumnya frame_height/2) |
 | `near_distance_stop_m` | 0.4 | Jarak (meter) memicu mundur, untuk rintangan VERTICAL |
 | `near_distance_turn_m` | 0.8 | Jarak (meter) memicu belok, untuk rintangan VERTICAL |
+| `near_distance_duck_m` | 0.8 | Jarak lantai (meter) ke kaki portal saat robot mulai merunduk |
 
-Kalau `use_distance_based: false` (default), perilaku identik v0.2.0 -- 100% backward compatible, tidak wajib dikonfigurasi.
+Kalau `use_distance_based: false` (default), perilaku tetap memakai `area_ratio`.
+
+### Konflik dua obstacle dalam satu frame
+
+Prioritas keselamatan node adalah:
+
+```text
+tiang vertical sangat dekat di jalur tengah  -> mundur (langsung, tanpa delay)
+tiang vertical dekat di jalur tengah         -> kiri/kanan
+portal horizontal dekat, lintasan aman       -> merunduk
+tidak ada ancaman                            -> maju
+```
+
+Perhitungan arah belok hanya memakai obstacle `vertical`; portal tidak ikut
+menambah beban kiri/kanan. Pada debug view, `detected=N` adalah deteksi YOLO
+di frame saat ini dan `tracked=N` adalah deteksi yang sudah tervalidasi antar
+frame. Tracker menahan deteksi baru sampai `obstacle_confirmation_frames`
+frame, lalu mempertahankan deteksi yang hilang sesaat selama
+`obstacle_hold_seconds` agar command tidak segera kembali ke `maju`.
 
 ---
 

@@ -12,8 +12,9 @@ bukan lewat import package level.
 
 from vision_avoidance_ros2.cv_model import CvModel
 from vision_avoidance_ros2.obstacle_classifier import Obstacle, ObstacleClassifier, ObstacleType
-from vision_avoidance_ros2.command_logic import CommandThresholds, decide_command
+from vision_avoidance_ros2.command_logic import CommandStabilizer, CommandThresholds, decide_command
 from vision_avoidance_ros2.distance_estimator import CameraGeometry, estimate_ground_distance
+from vision_avoidance_ros2.obstacle_tracker import ObstacleTracker
 
 __all__ = [
     "CvModel",
@@ -21,7 +22,9 @@ __all__ = [
     "ObstacleClassifier",
     "ObstacleType",
     "CommandThresholds",
+    "CommandStabilizer",
     "decide_command",
+    "ObstacleTracker",
     "CameraGeometry",
     "estimate_ground_distance",
 ]

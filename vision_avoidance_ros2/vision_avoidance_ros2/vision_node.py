@@ -22,9 +22,10 @@ vision_node.py Anda):
      robot pertama kali menghadapi rintangan sungguhan.
 
   4. Ground-plane distance estimation (opsional) -- kalau dikonfigurasi
-     di class_mapping.yaml (section `distance`), setiap rintangan
-     VERTICAL dapat estimasi jarak metrik (meter), dipakai command_logic
-     sebagai pengganti area_ratio yang lebih akurat.
+     di class_mapping.yaml (section `distance`), setiap rintangan yang
+     memiliki referensi di lantai dapat estimasi jarak metrik (meter).
+     Contohnya rintangan VERTICAL dan portal HORIZONTAL yang bbox-nya
+     mencakup kaki sampai lantai.
 
 CATATAN PLATFORM PENTING: cv2.imshow (dev popup preview) sebaiknya
 dipanggil dari MAIN THREAD, bukan dari worker thread -- beberapa platform
@@ -50,11 +51,21 @@ from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from vision_avoidance_ros2.command_logic import CommandThresholds, decide_command
+# Circuit breaker for error handling
+CIRCUIT_BREAKER_ERROR_THRESHOLD = 10
+CIRCUIT_BREAKER_RESET_INTERVAL_S = 10.0
+
+from vision_avoidance_ros2.command_logic import (
+    CommandStabilizer,
+    CommandThresholds,
+    decide_command,
+    emergency_stop_required,
+)
 from vision_avoidance_ros2.cv_model import CvModel
 from vision_avoidance_ros2.distance_estimator import CameraGeometry, estimate_ground_distance
 from vision_avoidance_ros2.metrics import CvMetricsWindow, CvTelemetryWriter
 from vision_avoidance_ros2.obstacle_classifier import ObstacleClassifier, ObstacleType
+from vision_avoidance_ros2.obstacle_tracker import ObstacleTracker
 from vision_avoidance_ros2.yolo_pipeline import (
     YoloParseStats,
     filter_by_size,
@@ -80,6 +91,17 @@ class VisionAvoidanceNode(Node):
         self.telemetry_enabled = p("telemetry_enabled").value
         self.diagnostics_log_every_n = p("diagnostics_log_every_n").value
         self.frame_buffer_size = max(1, int(p("frame_buffer_size").value))
+        self.command_stability_frames = max(1, int(p("command_stability_frames").value))
+        self.obstacle_confirmation_frames = max(
+            1, int(p("obstacle_confirmation_frames").value)
+        )
+        self.obstacle_hold_seconds = max(0.0, float(p("obstacle_hold_seconds").value))
+
+        # ---------------- Parameter validation ----------------
+        if self.frame_width <= 0 or self.frame_height <= 0:
+            raise ValueError("frame_width dan frame_height harus positif")
+        if self.capture_rate_hz <= 0:
+            raise ValueError("capture_rate_hz harus positif")
 
         model_path = p("model_path").value
         if not model_path:
@@ -111,6 +133,7 @@ class VisionAvoidanceNode(Node):
 
         self.classifier = ObstacleClassifier(
             class_mapping=cfg.get("class_mapping", {}),
+            ground_contact_classes=cfg.get("ground_contact_classes", []),
             vertical_aspect_ratio=float(cfg.get("vertical_aspect_ratio", 1.4)),
             horizontal_aspect_ratio=float(cfg.get("horizontal_aspect_ratio", 1.4)),
         )
@@ -156,6 +179,16 @@ class VisionAvoidanceNode(Node):
                 if self.distance_enabled and "near_distance_turn_m" in dist_cfg
                 else None
             ),
+            near_distance_duck_m=(
+                float(dist_cfg["near_distance_duck_m"])
+                if self.distance_enabled and "near_distance_duck_m" in dist_cfg
+                else None
+            ),
+        )
+        self._command_stabilizer = CommandStabilizer(self.command_stability_frames)
+        self._obstacle_tracker = ObstacleTracker(
+            confirmation_frames=self.obstacle_confirmation_frames,
+            hold_seconds=self.obstacle_hold_seconds,
         )
 
         # ---------------- Model ----------------
@@ -173,10 +206,16 @@ class VisionAvoidanceNode(Node):
                 "model berhasil dimuat ulang.",
             )
 
+        # Background thread untuk retry load model tiap 30 detik jika belum ready
+        self._model_retry_running = True
+        self._model_retry_thread = threading.Thread(target=self._model_retry_loop, daemon=True)
+        self._model_retry_thread.start()
+
         # ---------------- Telemetry (opsional) ----------------
         self._telemetry_writer: CvTelemetryWriter | None = None
         self._telemetry_window: CvMetricsWindow | None = None
         if self.telemetry_enabled:
+            os.makedirs("logs", exist_ok=True)
             self._telemetry_writer = CvTelemetryWriter("logs")
             self._telemetry_window = CvMetricsWindow(1.0)
             self.get_logger().info("Telemetry aktif, log ditulis ke folder 'logs/'.")
@@ -215,9 +254,15 @@ class VisionAvoidanceNode(Node):
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker_thread.start()
 
-        # ---------------- Publisher & kamera ----------------
-        self.publisher_ = self.create_publisher(String, self.publish_topic, 10)
+        # ---------------- Error tracking (circuit breaker) ----------------
+        self._consecutive_errors = 0
+        self._last_error_reset_time = time.time()
 
+        # ---------------- Camera ----------------
+        self._camera_retry_count = 0
+        self._max_camera_retries = 3
+        self._camera_last_fail_time = 0.0
+        
         self.cap = cv2.VideoCapture(self.camera_index)
         # CAP_PROP_BUFFERSIZE=1: paksa selalu ambil frame TERBARU dari
         # driver kamera, bukan frame lama yang tertahan di buffer internal
@@ -226,7 +271,10 @@ class VisionAvoidanceNode(Node):
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
         if not self.cap.isOpened():
-            self.get_logger().error(f"Tidak bisa membuka kamera index {self.camera_index}.")
+            self.get_logger().error(f"Tidak bisa membuka kamera index {self.camera_index}. Retry mechanism aktif.")
+
+        # ---------------- Publisher ----------------
+        self.publisher_ = self.create_publisher(String, self.publish_topic, 10)
 
         capture_period = 1.0 / max(self.capture_rate_hz, 1e-3)
         self.capture_timer = self.create_timer(capture_period, self.capture_callback)
@@ -264,6 +312,9 @@ class VisionAvoidanceNode(Node):
         self.declare_parameter("debug_view", False)
         self.declare_parameter("telemetry_enabled", False)
         self.declare_parameter("diagnostics_log_every_n", 30)
+        self.declare_parameter("command_stability_frames", 3)
+        self.declare_parameter("obstacle_confirmation_frames", 3)
+        self.declare_parameter("obstacle_hold_seconds", 0.30)
 
     @staticmethod
     def _load_yaml_config(path: str) -> dict:
@@ -301,12 +352,66 @@ class VisionAvoidanceNode(Node):
                 exc_info=True,
             )
 
+    def _reload_model(self, new_model_path: str) -> bool:
+        """Coba reload model dari path baru. Digunakan untuk recovery otomatis."""
+        self.get_logger().info(f"Mencoba reload model dari: {new_model_path}")
+        try:
+            # Release model lama jika ada
+            if self._model is not None:
+                self._model.release()
+
+            # Load model baru
+            new_model = CvModel(new_model_path, self.get_logger())
+            new_model.initialize()
+
+            # Replace model
+            self._model = new_model
+            self._models_ready = True
+
+            # Warm-up model baru
+            self._warm_up_model()
+
+            self.get_logger().info(f"Model berhasil reload dari: {new_model_path}")
+            self._consecutive_errors = 0  # Reset error counter setelah reload berhasil
+            return True
+
+        except Exception as e:
+            self.get_logger().error(f"Gagal reload model dari {new_model_path}: {e}", exc_info=True)
+            return False
+
+    def _model_retry_loop(self) -> None:
+        """Background thread: coba reload model setiap 30 detik jika belum ready."""
+        while self._model_retry_running:
+            if not self._models_ready:
+                try:
+                    model_path = self.get_parameter("model_path").value
+                    if model_path:
+                        self.get_logger().info("Retry otomatis: mencoba memuat model lagi...")
+                        self._reload_model(model_path)
+                except Exception as e:
+                    self.get_logger().error(f"Error saat retry load model: {e}")
+            time.sleep(30.0)
+
     # ------------------------------------------------------------------
     # CAPTURE (main thread, timer, CEPAT -- tidak pernah menunggu inferensi)
     # ------------------------------------------------------------------
     def capture_callback(self) -> None:
+        # Camera retry mechanism: coba reopen jika kamera tidak terbuka
         if not self.cap.isOpened():
+            current_time = time.time()
+            if (current_time - self._camera_last_fail_time) > CIRCUIT_BREAKER_RESET_INTERVAL_S:
+                if self._camera_retry_count < self._max_camera_retries:
+                    self._camera_retry_count += 1
+                    self._camera_last_fail_time = current_time
+                    self.get_logger().warn(
+                        f"Camera tidak terbuka, attempt retry {self._camera_retry_count}/{self._max_camera_retries}"
+                    )
+                    self.cap.open(self.camera_index)
+                else:
+                    self.get_logger().error("Camera permanently unavailable. Tidak dapat membuka kamera setelah beberapa retry.")
+                    self._camera_last_fail_time = current_time
             return
+
         ok, frame = self.cap.read()
         if not ok or frame is None:
             self.get_logger().warn("Gagal membaca frame dari webcam.")
@@ -334,6 +439,12 @@ class VisionAvoidanceNode(Node):
             frame_start = time.perf_counter()
             input_bytes = int(frame.nbytes)
 
+            # Reset error counter setiap CIRCUIT_BREAKER_RESET_INTERVAL_S detik
+            current_time = time.time()
+            if current_time - self._last_error_reset_time > CIRCUIT_BREAKER_RESET_INTERVAL_S:
+                self._consecutive_errors = 0
+                self._last_error_reset_time = current_time
+
             if not self._models_ready or self._model is None:
                 if self._popup_preview_enabled:
                     with self._preview_lock:
@@ -342,12 +453,39 @@ class VisionAvoidanceNode(Node):
                 continue
 
             try:
-                obstacles, parse_stats, detections_count = self._process_frame(frame)
-            except Exception:
-                self.get_logger().error("Error saat memproses frame di worker thread", exc_info=True)
+                raw_obstacles, parse_stats, detections_count = self._process_frame(frame)
+            except Exception as e:
+                self._consecutive_errors += 1
+                self.get_logger().error(
+                    f"Error saat memproses frame di worker thread (error #{self._consecutive_errors}): {e}",
+                    exc_info=True
+                )
+                # Circuit breaker: log critical jika error terlalu sering lalu reset system
+                if self._consecutive_errors >= CIRCUIT_BREAKER_ERROR_THRESHOLD:
+                    self.get_logger().fatal(
+                        f"Circuit breaker triggered: {self._consecutive_errors} errors dalam "
+                        f"{CIRCUIT_BREAKER_RESET_INTERVAL_S} detik. Periksa log detail."
+                    )
+                    # Reset counter dan coba reload model sebagai upaya recovery
+                    self._consecutive_errors = 0
+                    try:
+                        model_path = self.get_parameter("model_path").value
+                        if model_path:
+                            self._reload_model(model_path)
+                    except Exception as reload_exc:
+                        self.get_logger().error(f"Gagal reload model setelah circuit breaker: {reload_exc}")
                 continue
 
-            command = decide_command(obstacles, self.thresholds)
+            # Deteksi hanya menjadi dasar command normal setelah konsisten
+            # beberapa frame. Namun tiang yang sangat dekat tetap langsung
+            # memicu mundur dari deteksi mentah demi keselamatan.
+            tracked_obstacles = self._obstacle_tracker.update(raw_obstacles)
+            candidate_command = (
+                "mundur"
+                if emergency_stop_required(raw_obstacles, self.thresholds)
+                else decide_command(tracked_obstacles, self.thresholds)
+            )
+            command = self._command_stabilizer.update(candidate_command)
 
             msg = String()
             msg.data = command
@@ -358,10 +496,16 @@ class VisionAvoidanceNode(Node):
                 self.get_logger().info(f"Perintah: {command}")
                 self._last_command = command
 
-            self._log_diagnostics(parse_stats, len(obstacles))
+            self._log_diagnostics(parse_stats, len(raw_obstacles))
 
             if self._popup_preview_enabled:
-                vis = self._draw_debug(frame, obstacles, command)
+                vis = self._draw_debug(
+                    frame,
+                    raw_obstacles,
+                    command,
+                    candidate_command,
+                    tracked_count=len(tracked_obstacles),
+                )
                 with self._preview_lock:
                     self._latest_preview_frame = vis
 
@@ -414,17 +558,28 @@ class VisionAvoidanceNode(Node):
         obstacles = []
         for det in valid_detections:
             x, y, w, h = det["box"]
+            
+            # --- Bounding box validation (clamping ke frame bounds) ---
+            x = max(0, min(x, frame_width - 1))
+            y = max(0, min(y, frame_height - 1))
+            w = max(1, min(w, frame_width - x))
+            h = max(1, min(h, frame_height - y))
 
-            # Estimasi jarak ground-plane (opsional) -- pakai sisi BAWAH
-            # bounding box (y + h), karena itu titik yang paling mungkin
-            # menyentuh lantai (lihat distance_estimator.py untuk batasan).
+            # Estimasi jarak ground-plane hanya untuk bbox yang sisi bawahnya
+            # benar-benar menyentuh lantai: VERTICAL, atau kelas eksplisit
+            # seperti portal yang memiliki kaki. Palang melayang tidak boleh
+            # diproyeksikan ke lantai.
             distance_m = None
-            if self.distance_enabled and self.geometry is not None:
+            if (
+                self.distance_enabled
+                and self.geometry is not None
+                and self.classifier.has_ground_reference(det["class_name"], w, h)
+            ):
                 distance_m = estimate_ground_distance(float(y + h), self.geometry)
 
             obstacles.append(
                 self.classifier.build_obstacle(
-                    bbox=tuple(det["box"]),
+                    bbox=(x, y, w, h),
                     class_name=det["class_name"],
                     confidence=det["conf"],
                     frame_width=frame_width,
@@ -469,7 +624,14 @@ class VisionAvoidanceNode(Node):
             self._telemetry_writer.write_sample(sample)
 
     # ------------------------------------------------------------------
-    def _draw_debug(self, frame: np.ndarray, obstacles, command: str) -> np.ndarray:
+    def _draw_debug(
+        self,
+        frame: np.ndarray,
+        obstacles,
+        command: str,
+        candidate_command: str,
+        tracked_count: int,
+    ) -> np.ndarray:
         vis = frame.copy()
         color_map = {
             ObstacleType.VERTICAL: (0, 0, 255),
@@ -482,15 +644,32 @@ class VisionAvoidanceNode(Node):
             cv2.rectangle(vis, (x, y), (x + w, y + h), color, 2)
             label = f"{obs.class_name} [{obs.obstacle_type.value}] {obs.confidence:.2f}"
             if obs.distance_m is not None:
-                label += f" {obs.distance_m:.2f}m"
+                label += f" ground={obs.distance_m:.2f}m y={y + h}"
+            elif obs.has_ground_reference:
+                label += f" ground=calibrate y={y + h}"
             cv2.putText(vis, label, (x, max(y - 5, 10)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
         cv2.putText(vis, f"CMD: {command}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+        if candidate_command != command:
+            cv2.putText(
+                vis, f"candidate: {candidate_command}", (10, 75),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA
+            )
         cv2.putText(
             vis, f"proc={self._stats['processed']} drop={self._stats['dropped']}",
             (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA
+        )
+        cv2.putText(
+            vis,
+            f"detected={len(obstacles)} tracked={tracked_count}",
+            (10, 95),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (200, 200, 200),
+            1,
+            cv2.LINE_AA,
         )
         return vis
 
@@ -508,11 +687,6 @@ class VisionAvoidanceNode(Node):
         try:
             cv2.imshow(self._preview_window_name, image)
             self._preview_window_opened = True
-            # Pada beberapa backend OpenCV/GTK, WND_PROP_VISIBLE dapat
-            # mengembalikan 0 tepat setelah imshow() walaupun window baru
-            # saja dibuat dan masih terlihat. Jangan pakai properti itu
-            # untuk mematikan preview; gunakan tombol eksplisit agar popup
-            # tidak langsung tertutup secara keliru.
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q"), ord("Q")):
                 self.get_logger().info("Preview window ditutup oleh user (q/Esc).")
@@ -536,8 +710,10 @@ class VisionAvoidanceNode(Node):
     # ------------------------------------------------------------------
     def destroy_node(self) -> None:
         self._running = False
+        if hasattr(self, "_model_retry_running"):
+            self._model_retry_running = False
         if hasattr(self, "_worker_thread"):
-            self._worker_thread.join(timeout=2.0)
+            self._worker_thread.join(timeout=5.0)
             if self._worker_thread.is_alive():
                 self.get_logger().warn("Worker thread tidak berhenti dengan bersih (timeout).")
 

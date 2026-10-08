@@ -5,11 +5,10 @@ Klasifikasi tipe rintangan (VERTICAL/HORIZONTAL) -- strategi 2 lapis:
   1. Cek nama kelas hasil deteksi YOLO di class_mapping (dari config YAML).
   2. Fallback ke klasifikasi berbasis rasio tinggi/lebar bounding box.
 
-BARU (v0.3.0): field `distance_m` opsional -- jarak metrik hasil ground-plane
-projection (lihat distance_estimator.py), dihitung di vision_node.py dan
-di-passing ke sini. HANYA valid/diisi untuk rintangan yang menyentuh
-lantai (VERTICAL) -- untuk HORIZONTAL selalu None (lihat batasan di
-distance_estimator.py).
+Field `distance_m` opsional adalah jarak metrik hasil ground-plane
+projection. Nilai ini hanya disimpan untuk rintangan yang punya referensi
+di lantai: VERTICAL secara default, atau kelas eksplisit seperti `portal`
+yang bounding box-nya meliputi kaki sampai lantai.
 """
 
 from __future__ import annotations
@@ -35,18 +34,23 @@ class Obstacle:
     center_y_ratio: float             # posisi tengah vertikal, 0..1
     class_name: str
     confidence: float
-    distance_m: float | None = None   # jarak metrik ground-plane, HANYA untuk VERTICAL
+    distance_m: float | None = None   # jarak lantai dari kamera ke referensi objek
+    has_ground_reference: bool = False
 
 
 class ObstacleClassifier:
     def __init__(
         self,
         class_mapping: dict[str, str],
+        ground_contact_classes: list[str] | None = None,
         vertical_aspect_ratio: float = 1.4,
         horizontal_aspect_ratio: float = 1.4,
     ) -> None:
         self._class_mapping = {
             str(k): str(v).lower() for k, v in (class_mapping or {}).items()
+        }
+        self._ground_contact_classes = {
+            str(class_name) for class_name in (ground_contact_classes or [])
         }
         self._vertical_aspect_ratio = vertical_aspect_ratio
         self._horizontal_aspect_ratio = horizontal_aspect_ratio
@@ -66,6 +70,13 @@ class ObstacleClassifier:
             return ObstacleType.HORIZONTAL
         return ObstacleType.UNKNOWN
 
+    def has_ground_reference(self, class_name: str, w: float, h: float) -> bool:
+        """True bila sisi bawah bbox adalah titik objek yang menyentuh lantai."""
+        return (
+            class_name in self._ground_contact_classes
+            or self.classify(class_name, w, h) == ObstacleType.VERTICAL
+        )
+
     def build_obstacle(
         self,
         bbox: tuple[int, int, int, int],
@@ -83,11 +94,11 @@ class ObstacleClassifier:
         center_x_ratio = (x + w / 2.0) / frame_width if frame_width > 0 else 0.0
         center_y_ratio = (y + h / 2.0) / frame_height if frame_height > 0 else 0.0
 
-        # distance_m HANYA masuk akal untuk objek yang menyentuh lantai --
-        # buang nilainya kalau ternyata hasil klasifikasi bukan VERTICAL,
-        # supaya tidak ada nilai jarak yang menyesatkan tersimpan di
-        # rintangan HORIZONTAL/UNKNOWN.
-        final_distance = distance_m if obstacle_type == ObstacleType.VERTICAL else None
+        has_ground_reference = self.has_ground_reference(class_name, w, h)
+        # distance_m hanya bermakna bila bbox menyertakan titik objek yang
+        # menyentuh lantai. Ini memungkinkan portal tetap HORIZONTAL untuk
+        # aksi "merunduk", sambil memakai kaki portal sebagai referensi jarak.
+        final_distance = distance_m if has_ground_reference else None
 
         return Obstacle(
             obstacle_type=obstacle_type,
@@ -98,4 +109,5 @@ class ObstacleClassifier:
             class_name=class_name,
             confidence=confidence,
             distance_m=final_distance,
+            has_ground_reference=has_ground_reference,
         )

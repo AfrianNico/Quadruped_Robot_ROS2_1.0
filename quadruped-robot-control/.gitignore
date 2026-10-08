@@ -1,0 +1,9 @@
+.pio/
+.pio-mcp-workspace/
+.vscode/
+.clinerules/
+.kilo/
+docs/
+test/
+arduino.ino
+logs.log

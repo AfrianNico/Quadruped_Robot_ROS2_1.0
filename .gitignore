@@ -1,4 +1,14 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# PlatformIO / embedded build artifacts
+.pio/
+.pio-mcp-workspace/
+.codegraph/
+
+# Editor / OS
+.vscode/
+.DS_Store

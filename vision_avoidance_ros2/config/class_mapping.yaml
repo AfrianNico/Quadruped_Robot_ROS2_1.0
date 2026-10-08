@@ -7,7 +7,8 @@
 #      python3 -c "from ultralytics import YOLO; print(YOLO('best.pt').names)"
 # ====================================================================
 class_names:
-  - portal
+  - Portal
+  - Tiang
 
 # ====================================================================
 # 2) class_mapping -- portal diasumsikan HORIZONTAL (robot merunduk untuk
@@ -15,7 +16,17 @@ class_names:
 #    (bukan dilewati dengan merunduk), ganti nilainya jadi "vertical".
 # ====================================================================
 class_mapping:
-  portal: horizontal
+  Portal: horizontal
+  Tiang: vertical
+  
+
+# Kelas yang bounding box-nya mencakup titik yang menyentuh lantai.
+# Portal pada setup TA memiliki kaki di lantai; ground-plane memakai sisi
+# bawah bbox (kaki portal) untuk mengukur jarak maju sebelum robot merunduk.
+# Jangan masukkan palang/dahan yang benar-benar menggantung tanpa kaki.
+ground_contact_classes:
+  - Portal
+  - Tiang
 
 # ====================================================================
 # 3) Threshold deteksi & NMS -- nilai default, aman untuk mulai testing
@@ -30,10 +41,10 @@ horizontal_aspect_ratio: 1.4
 model_input_size: 640
 
 # ====================================================================
-# 4) Ground-plane distance -- MATI. Untuk kelas HORIZONTAL seperti portal,
-#    ground-plane distance MEMANG TIDAK BERLAKU (lihat distance_estimator.py
-#    dan command_logic.py) -- portal/palang tidak menyentuh lantai, jadi
-#    robot SELALU pakai area_ratio untuk kelas ini, apapun setting di sini.
+# 4) Ground-plane distance -- aktifkan HANYA sesudah nilai kalibrasi kamera
+#    di bawah diukur pada robot. Untuk `portal`, titik bawah bbox adalah kaki
+#    yang menyentuh lantai sehingga jarak ground-plane valid. Nilai jarak ini
+#    dipakai untuk menentukan kapan robot mulai merunduk.
 # ====================================================================
 distance:
   use_distance_based: false
@@ -43,3 +54,4 @@ distance:
   principal_point_y: 240.0
   near_distance_stop_m: 0.4
   near_distance_turn_m: 0.8
+  near_distance_duck_m: 0.8

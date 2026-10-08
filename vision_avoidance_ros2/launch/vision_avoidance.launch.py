@@ -14,7 +14,10 @@ def generate_launch_description():
         DeclareLaunchArgument('camera_index', default_value='0'),
         DeclareLaunchArgument('debug_view', default_value='false'),
         DeclareLaunchArgument('telemetry_enabled', default_value='false'),
-        DeclareLaunchArgument('capture_rate_hz', default_value='15.0'),
+        DeclareLaunchArgument('command_stability_frames', default_value='5'),
+        DeclareLaunchArgument('obstacle_confirmation_frames', default_value='3'),
+        DeclareLaunchArgument('obstacle_hold_seconds', default_value='0.30'),
+        DeclareLaunchArgument('capture_rate_hz', default_value='17.0'),
         DeclareLaunchArgument('frame_buffer_size', default_value='2'),
 
         Node(
@@ -28,6 +31,9 @@ def generate_launch_description():
                 'camera_index': LaunchConfiguration('camera_index'),
                 'debug_view': LaunchConfiguration('debug_view'),
                 'telemetry_enabled': LaunchConfiguration('telemetry_enabled'),
+                'command_stability_frames': LaunchConfiguration('command_stability_frames'),
+                'obstacle_confirmation_frames': LaunchConfiguration('obstacle_confirmation_frames'),
+                'obstacle_hold_seconds': LaunchConfiguration('obstacle_hold_seconds'),
                 'capture_rate_hz': LaunchConfiguration('capture_rate_hz'),
                 'frame_buffer_size': LaunchConfiguration('frame_buffer_size'),
             }],
