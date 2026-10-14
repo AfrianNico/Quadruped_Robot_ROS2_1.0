@@ -12,3 +12,4 @@ __pycache__/
 # Editor / OS
 .vscode/
 .DS_Store
+vision_avoidance_ros2/models/*.rknn
